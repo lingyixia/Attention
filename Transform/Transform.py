@@ -19,6 +19,7 @@ import time, argparse, functools
 import numpy as np
 import matplotlib.pyplot as plt
 
+tf.enable_eager_execution()
 parser = argparse.ArgumentParser(description='翻译Transform模型超参数设置')
 parser.add_argument('--batch_size', type=int, default=64, help='batchsize')
 parser.add_argument('--embedding_dim', type=int, default=256, help='embeddingsize')
@@ -34,27 +35,34 @@ parser.add_argument('--dropout_rate', type=int, default=0.1, help='dataPath')
 
 class DataHelper(object):
     def __init__(self):
-        examples, metadata = tfds.load('ted_hrlr_translate/pt_to_en', with_info=True, as_supervised=True)
+        examples = tfds.load('ted_hrlr_translate/pt_to_en', as_supervised=True)
         self.train_examples, self.val_examples = examples['train'], examples['validation']
         self.tokenizer_en = tfds.features.text.SubwordTextEncoder.build_from_corpus(
-            (en.numpy() for pt, en in self.train_examples),
-            target_vocab_size=2 ** 13)
+            (en.numpy() for pt, en in self.train_examples), target_vocab_size=2 ** 13)
         self.tokenizer_pt = tfds.features.text.SubwordTextEncoder.build_from_corpus(
-            (pt.numpy() for pt, en in self.train_examples),
-            target_vocab_size=2 ** 13)
+            (pt.numpy() for pt, en in self.train_examples), target_vocab_size=2 ** 13)
 
-    def encode(self, lang1, lang2):
+    def get_datasets(self, max_length, batch_size):
+        train_dataset = data_helper.train_examples.map(self.__tf_encode)
+        train_dataset = train_dataset.filter(
+            functools.partial(self.__filter_max_length, max_length=max_length))
+        train_dataset = train_dataset.cache()
+        train_dataset = train_dataset.shuffle(FLAGS.buffer_size).padded_batch(batch_size, padded_shapes=([-1], [-1]))
+        train_dataset = train_dataset.prefetch(tf.data.experimental.AUTOTUNE)
+        return train_dataset
+
+    def __encode(self, lang1, lang2):
         lang1 = [self.tokenizer_pt.vocab_size] + self.tokenizer_pt.encode(
             lang1.numpy()) + [self.tokenizer_pt.vocab_size + 1]
         lang2 = [self.tokenizer_en.vocab_size] + self.tokenizer_en.encode(
             lang2.numpy()) + [self.tokenizer_en.vocab_size + 1]
         return lang1, lang2
 
-    def filter_max_length(self, x, y, max_length):
+    def __filter_max_length(self, x, y, max_length):
         return tf.logical_and(tf.size(x) <= max_length, tf.size(y) <= max_length)
 
-    def tf_encode(self, pt, en):
-        return tf.py_function(self.encode, [pt, en], [tf.int64, tf.int64])
+    def __tf_encode(self, pt, en):
+        return tf.py_function(self.__encode, [pt, en], [tf.int64, tf.int64])
 
 
 class MultiHeadAttention(tf.keras.layers.Layer):
@@ -62,15 +70,10 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         super(MultiHeadAttention, self).__init__()
         self.num_heads = num_heads
         self.d_model = d_model
-
-        assert d_model % self.num_heads == 0
-
         self.depth = d_model // self.num_heads
-
         self.wq = tf.keras.layers.Dense(d_model)
         self.wk = tf.keras.layers.Dense(d_model)
         self.wv = tf.keras.layers.Dense(d_model)
-
         self.dense = tf.keras.layers.Dense(d_model)
 
     def split_heads(self, x, batch_size):
@@ -79,11 +82,9 @@ class MultiHeadAttention(tf.keras.layers.Layer):
 
     def call(self, v, k, q, mask):
         batch_size = tf.shape(q)[0]
-
         q = self.wq(q)  # (batch_size, seq_len, d_model)
         k = self.wk(k)  # (batch_size, seq_len, d_model)
         v = self.wv(v)  # (batch_size, seq_len, d_model)
-
         q = self.split_heads(q, batch_size)  # (batch_size, num_heads, seq_len_q, depth)
         k = self.split_heads(k, batch_size)  # (batch_size, num_heads, seq_len_k, depth)
         v = self.split_heads(v, batch_size)  # (batch_size, num_heads, seq_len_v, depth)
@@ -123,10 +124,10 @@ class EncoderLayer(tf.keras.layers.Layer):
     def call(self, x, training, mask):
         attn_output, _ = self.mha(x, x, x, mask)  # (batch_size, input_seq_len, d_model)
         attn_output = self.dropout1(attn_output, training=training)
-        out1 = self.layernorm1(x + attn_output)  # (batch_size, input_seq_len, d_model)
+        out1 = self.layernorm1(x + attn_output)  # 第一个残差忘了  # (batch_size, input_seq_len, d_model)
         ffn_output = self.ffn(out1)  # (batch_size, input_seq_len, d_model)
         ffn_output = self.dropout2(ffn_output, training=training)
-        out2 = self.layernorm2(out1 + ffn_output)  # (batch_size, input_seq_len, d_model)
+        out2 = self.layernorm2(out1 + ffn_output)  # 第二个残差网络  # (batch_size, input_seq_len, d_model)
         return out2
 
 
@@ -143,20 +144,25 @@ class DecoderLayer(tf.keras.layers.Layer):
         self.dropout2 = tf.keras.layers.Dropout(rate)
         self.dropout3 = tf.keras.layers.Dropout(rate)
 
-    def point_wise_feed_forward_network(self, d_model, dff):
+    def point_wise_feed_forward_network(self, d_model, dff):  # 前馈网络其实就是先正达维度在减少到原来的维度，前后shape不变
         return tf.keras.Sequential([
             tf.keras.layers.Dense(dff, activation='relu'),  # (batch_size, seq_len, dff)
             tf.keras.layers.Dense(d_model)  # (batch_size, seq_len, d_model)
         ])
 
     def call(self, x, enc_output, training, look_ahead_mask, padding_mask):
-        attn1, attn_weights_block1 = self.mha1(x, x, x, look_ahead_mask)  # (batch_size, target_seq_len, d_model)
+        attn1, attn_weights_block1 = self.mha1(x,
+                                               x,
+                                               x,
+                                               look_ahead_mask)  # Self-Attention:v，k，q一样(batch_size, target_seq_len, d_model)
         attn1 = self.dropout1(attn1, training=training)
-        out1 = self.layernorm1(attn1 + x)
-        attn2, attn_weights_block2 = self.mha2(
-            enc_output, enc_output, out1, padding_mask)  # (batch_size, target_seq_len, d_model)
+        out1 = self.layernorm1(attn1 + x)  # 第一个残差网络
+        attn2, attn_weights_block2 = self.mha2(enc_output,
+                                               enc_output,
+                                               out1,
+                                               padding_mask)  # 普通Attention  # (batch_size, target_seq_len, d_model)
         attn2 = self.dropout2(attn2, training=training)
-        out2 = self.layernorm2(attn2 + out1)  # (batch_size, target_seq_len, d_model)
+        out2 = self.layernorm2(attn2 + out1)  # 第二个残差网络  # (batch_size, target_seq_len, d_model)
         ffn_output = self.ffn(out2)  # (batch_size, target_seq_len, d_model)
         ffn_output = self.dropout3(ffn_output, training=training)
         out3 = self.layernorm3(ffn_output + out2)  # (batch_size, target_seq_len, d_model)
@@ -271,7 +277,12 @@ class NMT(object):
         self.tokenizer_en = tokenizer_en
         self.train_loss = tf.keras.metrics.Mean(name='train_loss')
         self.train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
-        self.transformer = Transformer(num_layers, d_model, num_heads, dff, input_vocab_size, target_vocab_size,
+        self.transformer = Transformer(num_layers,
+                                       d_model,
+                                       num_heads,
+                                       dff,
+                                       tokenizer_pt.vocab_size + 2,
+                                       tokenizer_en.vocab_size + 2,
                                        dropout_rate)
         checkpoint_path = "./checkpoints/train"
         learning_rate = CustomSchedule(d_model)
@@ -307,7 +318,7 @@ class NMT(object):
         loss_ *= mask
         return tf.reduce_mean(loss_)
 
-    def train(self):
+    def train(self, train_dataset):
         EPOCHS = 2
         for epoch in range(EPOCHS):
             start = time.time()
@@ -369,7 +380,7 @@ class NMT(object):
                                                               enc_padding_mask,
                                                               combined_mask,
                                                               dec_padding_mask)
-            predictions = predictions[:, -1:, :]  # (batch_size, 1, vocab_size)
+            predictions = predictions[:, -1:, :]
             predicted_id = tf.cast(tf.argmax(predictions, axis=-1), tf.int32)
             if tf.equal(predicted_id, self.tokenizer_en.vocab_size + 1):
                 return tf.squeeze(output, axis=0), attention_weights
@@ -396,13 +407,7 @@ class NMT(object):
 if __name__ == '__main__':
     FLAGS = parser.parse_known_args()[0]
     data_helper = DataHelper()
-    train_dataset = data_helper.train_examples.map(data_helper.tf_encode)
-    train_dataset = train_dataset.filter(functools.partial(data_helper.filter_max_length, max_length=FLAGS.max_length))
-    train_dataset = train_dataset.cache()
-    train_dataset = train_dataset.shuffle(FLAGS.buffer_size).padded_batch(FLAGS.batch_size, padded_shapes=([-1], [-1]))
-    train_dataset = train_dataset.prefetch(tf.data.experimental.AUTOTUNE)
-    input_vocab_size = data_helper.tokenizer_pt.vocab_size + 2
-    target_vocab_size = data_helper.tokenizer_en.vocab_size + 2
+    train_dataset = data_helper.get_datasets(max_length=FLAGS.max_length, batch_size=FLAGS.batch_size)
     nmt = NMT(data_helper.tokenizer_pt,
               data_helper.tokenizer_en,
               FLAGS.max_length,
@@ -411,6 +416,6 @@ if __name__ == '__main__':
               FLAGS.dff,
               FLAGS.num_heads,
               FLAGS.dropout_rate)
-    nmt.train()
+    nmt.train(train_dataset)
     nmt.translate("este é um problema que temos que resolver.")
     print("Real translation: this is a problem we have to solve .")
