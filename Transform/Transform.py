@@ -9,7 +9,6 @@
 # @Contact       chenfeiyu01@baidu.com
 # @Version       1.0
 # @Description:
-# @REF:https://github.com/tensorflow/docs/blob/master/site/en/r2/tutorials/text/transformer.ipynb
 # -------------------------------------------------------------------------------
 # -*- coding: utf-8 -*-
 import tensorflow_datasets as tfds
